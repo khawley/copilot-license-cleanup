@@ -20,6 +20,7 @@ interface Input {
   jobSummary: boolean;
   csv: boolean;
   artifactName: string;
+  allowlist: string[];
 }
 
 export function getInputs(): Input {
@@ -33,6 +34,8 @@ export function getInputs(): Input {
   result.jobSummary = core.getBooleanInput('job-summary');
   result.csv = core.getBooleanInput('csv');
   result.artifactName = core.getInput('artifact-name');
+  const allowlistInput = core.getInput('allowlist');
+  result.allowlist = allowlistInput ? allowlistInput.split(',').map(username => username.trim()) : [];
   return result;
 }
 
@@ -113,10 +116,10 @@ const run = async (): Promise<void> => {
       core.warning(`No seats found for organization ${org}`);
       continue;
     }
-    
+
     const msToDays = (d: number): number => Math.ceil(d / (1000 * 3600 * 24));
     const now = new Date();
-    
+
     const inactiveSeats = seats.seats.filter(seat => {
       if (seat.last_activity_at === null || seat.last_activity_at === undefined) {
         const created = new Date(seat.created_at);
@@ -134,8 +137,26 @@ const run = async (): Promise<void> => {
       inactive: inactiveSeats.map(seat => ({ ...seat, organization: org })) as SeatWithOrg[]
     };
 
+    // Calculate skippedSeats here so it can be used in both removeInactive and jobSummary sections
+    const skippedSeats = inactiveSeats.filter(seat =>
+      !seat.assigning_team &&
+      input.allowlist?.some(allowedUser => allowedUser === seat.assignee.login as string)
+    );
+
     if (input.removeInactive) {
-      const seatsToRemove = inactiveSeats.filter(seat => !seat.assigning_team);
+      const seatsToRemove = inactiveSeats.filter(seat =>
+        !seat.assigning_team &&
+        !input.allowlist?.some(allowedUser => allowedUser === seat.assignee.login as string)
+      );
+
+      // Always log allowlist information, even if no seats were skipped
+      core.info(`Skipping removal for users in allowlist: ${skippedSeats.length} inactive seats - ${skippedSeats.map(seat => seat.assignee.login).join(', ')}`);
+
+      // Add a debug log to help troubleshoot test issues
+      core.debug(`Allowlist: ${input.allowlist.join(', ')}`);
+      core.debug(`Inactive seats: ${inactiveSeats.length}`);
+      core.debug(`Skipped seats: ${skippedSeats.length}`);
+
       if (seatsToRemove.length > 0) {
         await core.group('Removing inactive seats', async () => {
           const response = await octokit.rest.copilot.cancelCopilotSeatAssignmentForUsers({
@@ -178,7 +199,27 @@ const run = async (): Promise<void> => {
     if (input.jobSummary) {
       await core.summary
         .addHeading(`${org} - Inactive Seats: ${inactiveSeats.length} / ${seats.total_seats}`)
+
+      if (skippedSeats.length > 0) {
+        core.summary.addHeading(`Skipped Seats (in allowlist): ${skippedSeats.length}`, 3);
+        core.summary.addTable([
+          [
+            { data: 'Avatar', header: true },
+            { data: 'Login', header: true },
+            { data: 'Last Activity', header: true },
+            { data: 'Last Editor Used', header: true }
+          ],
+          ...skippedSeats.map(seat => [
+            `<img src="${seat.assignee.avatar_url}" width="33" />`,
+            seat.assignee.login || 'Unknown',
+            seat.last_activity_at === null ? 'No activity' : momemt(seat.last_activity_at).fromNow(),
+            seat.last_activity_editor || 'Unknown'
+          ] as SummaryTableRow)
+        ]);
+      }
+
       if (seats.total_seats || 0 > 0) {
+        core.summary.addHeading(`All Inactive Seats: ${inactiveSeats.length}`, 3);
         core.summary.addTable([
           [
             { data: 'Avatar', header: true },
